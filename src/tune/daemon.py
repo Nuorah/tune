@@ -128,13 +128,38 @@ class TuneDaemon:
         }
 
     def _status(self) -> dict[str, Any]:
+        playback = self._playback_status()
         if self.client is None:
-            return {"ok": True, "connected": False}
+            return {"ok": True, "connected": False, "playback": playback}
         return {
             "ok": True,
             "connected": True,
             "server": self.client.server_url,
             "username": self.client.username,
+            "playback": playback,
+        }
+
+    def _playback_status(self) -> dict[str, Any]:
+        if self.player is None:
+            return {"state": "stopped"}
+
+        status = self.player.status()
+        if not status.active:
+            return {"state": "stopped"}
+        index = status.playlist_index
+        if index is None or not 0 <= index < len(self.playlist):
+            raise PlayerError("mpv returned a playlist position outside the current queue")
+
+        song = self.playlist[index]
+        return {
+            "state": "paused" if status.paused else "playing",
+            "artist": song.artist,
+            "album": song.album,
+            "title": song.title,
+            "number": index + 1,
+            "total": len(self.playlist),
+            "position": status.position,
+            "duration": status.duration,
         }
 
     def _albums(self, request: dict[str, Any]) -> dict[str, Any]:

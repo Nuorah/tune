@@ -18,7 +18,7 @@ from unittest import mock
 
 import tune.cli as cli
 from tune.daemon import TuneDaemon
-from tune.player import MpvPlayer, PlayerError, StreamProxy
+from tune.player import MpvPlayer, PlaybackStatus, PlayerError, StreamProxy
 from tune.protocol import ProtocolError, receive_message, send_message
 from tune.runtime import control_socket_path, runtime_dir
 from tune.subsonic import Album, AudioStream, Song, SubsonicClient, SubsonicError
@@ -396,6 +396,47 @@ class MpvPlayerTests(unittest.TestCase):
                 ],
             )
 
+    def test_status_reads_active_playback_properties(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            player = self._player(temporary_directory)
+            process = mock.Mock()
+            process.poll.return_value = None
+            player._process = process
+
+            with mock.patch.object(
+                player,
+                "_command",
+                side_effect=[False, True, 2, 42.5, 180.0],
+            ) as command:
+                status = player.status()
+
+            self.assertEqual(status, PlaybackStatus(True, True, 2, 42.5, 180.0))
+            self.assertEqual(
+                command.call_args_list,
+                [
+                    mock.call(["get_property", "idle-active"]),
+                    mock.call(["get_property", "pause"]),
+                    mock.call(["get_property", "playlist-pos"]),
+                    mock.call(["get_property", "time-pos"]),
+                    mock.call(["get_property", "duration"]),
+                ],
+            )
+            player._process = None
+
+    def test_status_stops_querying_when_mpv_is_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            player = self._player(temporary_directory)
+            process = mock.Mock()
+            process.poll.return_value = None
+            player._process = process
+
+            with mock.patch.object(player, "_command", return_value=True) as command:
+                status = player.status()
+
+            self.assertEqual(status, PlaybackStatus(False, False, None, None, None))
+            command.assert_called_once_with(["get_property", "idle-active"])
+            player._process = None
+
     def test_close_quits_and_reaps_mpv(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             player = self._player(temporary_directory)
@@ -459,6 +500,9 @@ class _FakePlayer:
     def __init__(self) -> None:
         self.urls: list[str] = []
         self.actions: list[str] = []
+        self.paused = False
+        self.stopped = False
+        self.playlist_index = 0
         self.closed = False
 
     def start(self, urls: list[str]) -> None:
@@ -466,18 +510,28 @@ class _FakePlayer:
 
     def pause(self) -> None:
         self.actions.append("pause")
+        self.paused = True
 
     def resume(self) -> None:
         self.actions.append("resume")
+        self.paused = False
 
     def next_track(self) -> None:
         self.actions.append("next")
+        self.playlist_index += 1
 
     def previous_track(self) -> None:
         self.actions.append("previous")
+        self.playlist_index -= 1
 
     def stop(self) -> None:
         self.actions.append("stop")
+        self.stopped = True
+
+    def status(self) -> PlaybackStatus:
+        if self.stopped:
+            return PlaybackStatus(False, False, None, None, None)
+        return PlaybackStatus(True, self.paused, self.playlist_index, 42.5, 251.0)
 
     def close(self) -> None:
         self.closed = True
@@ -513,6 +567,7 @@ class DaemonTests(unittest.TestCase):
             played = daemon._handle_request({"command": "play", "number": 1})
             player = daemon.player
             proxy = daemon.stream_proxy
+            playing_status = daemon._handle_request({"command": "status"})
             controls = [
                 daemon._handle_request({"command": command})
                 for command in ("pause", "resume", "next", "previous", "stop")
@@ -533,6 +588,20 @@ class DaemonTests(unittest.TestCase):
         self.assertTrue(connected["ok"])
         self.assertEqual(request["password"], "")
         self.assertTrue(status["connected"])
+        self.assertEqual(status["playback"], {"state": "stopped"})
+        self.assertEqual(
+            playing_status["playback"],
+            {
+                "state": "playing",
+                "artist": "Radiohead",
+                "album": "Kid A",
+                "title": "Everything in Its Right Place",
+                "number": 1,
+                "total": 2,
+                "position": 42.5,
+                "duration": 251.0,
+            },
+        )
         self.assertEqual(albums["albums"][0]["number"], 1)
         self.assertNotIn("id", albums["albums"][0])
         self.assertEqual(played["first_song"], "Everything in Its Right Place")
@@ -559,6 +628,36 @@ class DaemonTests(unittest.TestCase):
 
 
 class CLITests(unittest.TestCase):
+    def test_status_prints_connection_and_paused_track(self) -> None:
+        response = {
+            "ok": True,
+            "connected": True,
+            "server": "https://music.example",
+            "username": "alice",
+            "playback": {
+                "state": "paused",
+                "artist": "Radiohead",
+                "album": "Kid A",
+                "title": "Optimistic",
+                "number": 6,
+                "total": 10,
+                "position": 62.9,
+                "duration": 315.0,
+            },
+        }
+        output = io.StringIO()
+
+        with mock.patch("tune.cli._send_request", return_value=response):
+            with redirect_stdout(output):
+                result = cli._command_status(argparse.Namespace())
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            output.getvalue(),
+            "Connected to https://music.example as alice\n"
+            "Paused 6/10: Radiohead — Optimistic (Kid A) [1:02 / 5:15]\n",
+        )
+
     def test_albums_prints_numbered_sanitized_results(self) -> None:
         response = {
             "ok": True,

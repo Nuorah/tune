@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,15 @@ MPV_COMMAND_TIMEOUT = 2.0
 
 class PlayerError(RuntimeError):
     """A safe-to-display playback error."""
+
+
+@dataclass(frozen=True, slots=True)
+class PlaybackStatus:
+    active: bool
+    paused: bool
+    playlist_index: int | None
+    position: float | None
+    duration: float | None
 
 
 class _ProxyServer(ThreadingHTTPServer):
@@ -146,6 +156,41 @@ class MpvPlayer:
 
     def stop(self) -> None:
         self._command(["stop"])
+
+    def status(self) -> PlaybackStatus:
+        if self._process is None or self._process.poll() is not None:
+            return PlaybackStatus(False, False, None, None, None)
+
+        idle = self._command(["get_property", "idle-active"])
+        if not isinstance(idle, bool):
+            raise PlayerError("mpv returned an invalid playback state")
+        if idle:
+            return PlaybackStatus(False, False, None, None, None)
+
+        paused = self._command(["get_property", "pause"])
+        playlist_index = self._command(["get_property", "playlist-pos"])
+        position = self._command(["get_property", "time-pos"])
+        duration = self._command(["get_property", "duration"])
+        if not isinstance(paused, bool):
+            raise PlayerError("mpv returned an invalid pause state")
+        if not isinstance(playlist_index, int) or isinstance(playlist_index, bool):
+            raise PlayerError("mpv returned an invalid playlist position")
+        if position is not None and (
+            not isinstance(position, (int, float)) or isinstance(position, bool)
+        ):
+            raise PlayerError("mpv returned an invalid playback position")
+        if duration is not None and (
+            not isinstance(duration, (int, float)) or isinstance(duration, bool)
+        ):
+            raise PlayerError("mpv returned an invalid track duration")
+
+        return PlaybackStatus(
+            True,
+            paused,
+            playlist_index,
+            float(position) if position is not None else None,
+            float(duration) if duration is not None else None,
+        )
 
     def close(self) -> None:
         process = self._process

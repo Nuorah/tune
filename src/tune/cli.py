@@ -163,11 +163,75 @@ def _command_status(_args: argparse.Namespace) -> int:
         print("Not connected")
         return 0
 
-    if response.get("connected") is True:
-        print(f"Connected to {response['server']} as {response['username']}")
-    else:
+    if response.get("connected") is not True:
         print("Not connected")
+        return 0
+
+    server = response.get("server")
+    username = response.get("username")
+    if not isinstance(server, str) or not isinstance(username, str):
+        raise CLIError("daemon returned invalid connection metadata")
+    print(f"Connected to {_terminal_safe(server)} as {_terminal_safe(username)}")
+    _display_playback_status(response.get("playback"))
     return 0
+
+
+def _display_playback_status(playback: Any) -> None:
+    if not isinstance(playback, dict):
+        raise CLIError("daemon returned an invalid playback status")
+    state = playback.get("state")
+    if state == "stopped":
+        print("Playback stopped")
+        return
+    if state not in {"playing", "paused"}:
+        raise CLIError("daemon returned an invalid playback state")
+
+    artist = playback.get("artist")
+    album = playback.get("album")
+    title = playback.get("title")
+    number = playback.get("number")
+    total = playback.get("total")
+    if (
+        not isinstance(artist, str)
+        or not isinstance(album, str)
+        or not isinstance(title, str)
+        or not isinstance(number, int)
+        or isinstance(number, bool)
+        or not isinstance(total, int)
+        or isinstance(total, bool)
+    ):
+        raise CLIError("daemon returned invalid current-track metadata")
+
+    timing = _format_timing(playback.get("position"), playback.get("duration"))
+    label = "Paused" if state == "paused" else "Playing"
+    print(
+        f"{label} {number}/{total}: {_terminal_safe(artist)} — "
+        f"{_terminal_safe(title)} ({_terminal_safe(album)}){timing}"
+    )
+
+
+def _format_timing(position: Any, duration: Any) -> str:
+    values = (position, duration)
+    if any(
+        value is not None
+        and (not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0)
+        for value in values
+    ):
+        raise CLIError("daemon returned invalid playback timing")
+    if position is None and duration is None:
+        return ""
+    left = _format_seconds(position) if position is not None else "--:--"
+    right = _format_seconds(duration) if duration is not None else "--:--"
+    return f" [{left} / {right}]"
+
+
+def _format_seconds(value: int | float) -> str:
+    seconds = int(value)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02}:{seconds:02}"
+    return f"{minutes}:{seconds:02}"
 
 
 def _command_albums(args: argparse.Namespace) -> int:
