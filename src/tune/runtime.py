@@ -40,3 +40,8 @@ def runtime_dir() -> Path:
 def control_socket_path() -> Path:
     """Return the daemon's Unix-domain control socket path."""
     return runtime_dir() / "control.sock"
+
+
+def player_socket_path() -> Path:
+    """Return mpv's Unix-domain control socket path."""
+    return runtime_dir() / "player.sock"

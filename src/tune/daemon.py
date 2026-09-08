@@ -10,15 +10,19 @@ import struct
 from pathlib import Path
 from typing import Any
 
+from tune.player import MpvPlayer, PlayerError, StreamProxy
 from tune.protocol import ProtocolError, receive_message, send_message
 from tune.runtime import RuntimeSecurityError, control_socket_path
-from tune.subsonic import Album, SubsonicClient, SubsonicError
+from tune.subsonic import Album, Song, SubsonicClient, SubsonicError
 
 
 class TuneDaemon:
     def __init__(self) -> None:
         self.client: SubsonicClient | None = None
         self.last_albums: list[Album] = []
+        self.player: MpvPlayer | None = None
+        self.stream_proxy: StreamProxy | None = None
+        self.playlist: list[Song] = []
         self.stop_requested = False
         self.listener: socket.socket | None = None
         self.socket_path: Path | None = None
@@ -63,7 +67,7 @@ class TuneDaemon:
             self._verify_peer(connection)
             request = receive_message(connection)
             response = self._handle_request(request)
-        except (ProtocolError, SubsonicError, ValueError) as error:
+        except (ProtocolError, SubsonicError, PlayerError, ValueError) as error:
             response = {"ok": False, "error": str(error)}
         except (ConnectionError, TimeoutError):
             return
@@ -85,6 +89,10 @@ class TuneDaemon:
             return self._albums(request)
         if command == "search":
             return self._search(request)
+        if command == "play":
+            return self._play(request)
+        if command in {"pause", "resume", "next", "previous", "stop"}:
+            return self._playback_control(command)
         if command == "disconnect":
             return self._disconnect()
         raise ValueError("unknown command")
@@ -108,6 +116,7 @@ class TuneDaemon:
             request["password"] = ""
             password = ""
 
+        self._close_playback()
         if self.client is not None:
             self.client.wipe_credentials()
         self.client = candidate
@@ -178,7 +187,85 @@ class TuneDaemon:
             ],
         }
 
+    def _play(self, request: dict[str, Any]) -> dict[str, Any]:
+        if self.client is None:
+            raise ValueError("not connected")
+
+        number = request.get("number")
+        if not isinstance(number, int) or isinstance(number, bool):
+            raise ValueError("album number must be an integer")
+        if not 1 <= number <= len(self.last_albums):
+            raise ValueError("album number is not in the last results")
+
+        album = self.last_albums[number - 1]
+        songs = self.client.get_album(album.id)
+        if not songs:
+            raise PlayerError("album contains no playable songs")
+
+        created_proxy = False
+        if self.stream_proxy is None:
+            try:
+                self.stream_proxy = StreamProxy(self.client)
+            except OSError:
+                raise PlayerError("could not start local stream proxy") from None
+            created_proxy = True
+        if self.player is None:
+            self.player = MpvPlayer()
+
+        urls = [self.stream_proxy.url_for(song.id) for song in songs]
+        try:
+            self.player.start(urls)
+        except Exception:
+            if created_proxy:
+                self.stream_proxy.close()
+                self.stream_proxy = None
+            raise
+
+        self.playlist = songs
+        first = songs[0]
+        return {
+            "ok": True,
+            "album": album.name,
+            "artist": album.artist,
+            "song_count": len(songs),
+            "first_song": first.title,
+        }
+
+    def _playback_control(self, command: str) -> dict[str, Any]:
+        if self.player is None:
+            raise PlayerError("nothing is playing")
+
+        if command == "pause":
+            self.player.pause()
+        elif command == "resume":
+            self.player.resume()
+        elif command == "next":
+            self.player.next_track()
+        elif command == "previous":
+            self.player.previous_track()
+        elif command == "stop":
+            self.player.stop()
+        else:
+            raise ValueError("unknown playback command")
+        return {"ok": True, "action": command}
+
+    def _close_playback(self) -> None:
+        if self.player is not None:
+            try:
+                self.player.close()
+            except Exception:
+                pass
+            self.player = None
+        if self.stream_proxy is not None:
+            try:
+                self.stream_proxy.close()
+            except Exception:
+                pass
+            self.stream_proxy = None
+        self.playlist = []
+
     def _disconnect(self) -> dict[str, Any]:
+        self._close_playback()
         if self.client is not None:
             self.client.wipe_credentials()
             self.client = None
@@ -204,6 +291,7 @@ class TuneDaemon:
         signal.signal(signal.SIGHUP, request_stop)
 
     def _cleanup(self) -> None:
+        self._close_playback()
         if self.client is not None:
             self.client.wipe_credentials()
             self.client = None

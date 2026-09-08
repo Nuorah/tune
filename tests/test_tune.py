@@ -11,15 +11,17 @@ import tempfile
 import unittest
 import urllib.error
 import urllib.parse
+import urllib.request
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
 import tune.cli as cli
 from tune.daemon import TuneDaemon
+from tune.player import MpvPlayer, PlayerError, StreamProxy
 from tune.protocol import ProtocolError, receive_message, send_message
 from tune.runtime import control_socket_path, runtime_dir
-from tune.subsonic import Album, SubsonicClient, SubsonicError
+from tune.subsonic import Album, AudioStream, Song, SubsonicClient, SubsonicError
 
 
 class RuntimeTests(unittest.TestCase):
@@ -53,18 +55,32 @@ class ProtocolTests(unittest.TestCase):
 
 
 class _FakeResponse:
-    def __init__(self, body: bytes) -> None:
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.body = body
-        self.headers: dict[str, str] = {}
+        self.status = status
+        self.headers = headers or {}
+        self.position = 0
+        self.closed = False
 
     def __enter__(self) -> _FakeResponse:
         return self
 
     def __exit__(self, *_args: object) -> None:
-        return None
+        self.close()
 
     def read(self, limit: int) -> bytes:
-        return self.body[:limit]
+        chunk = self.body[self.position : self.position + limit]
+        self.position += len(chunk)
+        return chunk
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _FakeOpener:
@@ -134,6 +150,99 @@ class SubsonicTests(unittest.TestCase):
         self.assertEqual(query["size"], ["25"])
         self.assertEqual(query["offset"], ["50"])
 
+    def test_open_stream_forwards_range_without_exposing_url(self) -> None:
+        response = _FakeResponse(
+            b"abcdef",
+            status=206,
+            headers={
+                "Content-Type": "audio/flac",
+                "Content-Length": "6",
+                "Content-Range": "bytes 10-15/100",
+                "Accept-Ranges": "bytes",
+            },
+        )
+        opener = _FakeOpener(response)
+        client = SubsonicClient("https://music.example", "alice", "swordfish")
+        client._opener = opener  # type: ignore[assignment]
+
+        with client.open_stream("song-id", byte_range="bytes=10-15") as stream:
+            self.assertEqual(stream.status, 206)
+            self.assertEqual(stream.content_type, "audio/flac")
+            self.assertEqual(stream.content_length, 6)
+            self.assertEqual(stream.content_range, "bytes 10-15/100")
+            self.assertEqual(stream.accept_ranges, "bytes")
+            self.assertEqual(stream.read(3), b"abc")
+            self.assertEqual(stream.read(3), b"def")
+            self.assertFalse(hasattr(stream, "url"))
+
+        self.assertTrue(response.closed)
+        request = opener.request_url
+        parsed = urllib.parse.urlsplit(request)
+        self.assertEqual(parsed.path, "/rest/stream.view")
+        self.assertEqual(urllib.parse.parse_qs(parsed.query)["id"], ["song-id"])
+
+    def test_open_stream_rejects_invalid_range(self) -> None:
+        client = SubsonicClient("https://music.example", "alice", "swordfish")
+        with self.assertRaisesRegex(ValueError, "invalid byte range"):
+            client.open_stream("song-id", byte_range="bytes=0-1\r\nX-Evil: yes")
+
+    def test_get_album_preserves_song_order_and_metadata(self) -> None:
+        body = json.dumps(
+            {
+                "subsonic-response": {
+                    "status": "ok",
+                    "album": {
+                        "name": "Kid A",
+                        "artist": "Radiohead",
+                        "song": [
+                            {
+                                "id": "song-2",
+                                "title": "Kid A",
+                                "track": 2,
+                                "discNumber": 1,
+                                "duration": 284,
+                            },
+                            {
+                                "id": "song-1",
+                                "title": "Everything in Its Right Place",
+                                "artist": "Radiohead",
+                                "album": "Kid A",
+                                "track": 1,
+                            },
+                        ],
+                    },
+                }
+            }
+        ).encode()
+        opener = _FakeOpener(_FakeResponse(body))
+        client = SubsonicClient("https://music.example", "alice", "swordfish")
+        client._opener = opener  # type: ignore[assignment]
+
+        songs = client.get_album("album-secret-id")
+
+        self.assertEqual(
+            songs,
+            [
+                Song("song-2", "Kid A", "Radiohead", "Kid A", 2, 1, 284),
+                Song(
+                    "song-1",
+                    "Everything in Its Right Place",
+                    "Radiohead",
+                    "Kid A",
+                    1,
+                    None,
+                    None,
+                ),
+            ],
+        )
+        parsed = urllib.parse.urlsplit(opener.request_url)
+        self.assertEqual(parsed.path, "/rest/getAlbum.view")
+        self.assertEqual(
+            urllib.parse.parse_qs(parsed.query)["id"],
+            ["album-secret-id"],
+        )
+        self.assertFalse(hasattr(songs[0], "url"))
+
     def test_search_albums_uses_server_side_search(self) -> None:
         body = json.dumps(
             {
@@ -189,6 +298,121 @@ class SubsonicTests(unittest.TestCase):
         self.assertNotIn(opener.request_url, message)
 
 
+class _FakeStreamingClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str | None]] = []
+
+    def open_stream(
+        self,
+        song_id: str,
+        *,
+        byte_range: str | None = None,
+    ) -> AudioStream:
+        self.calls.append((song_id, byte_range))
+        return AudioStream(
+            _FakeResponse(
+                b"audio-data",
+                status=206,
+                headers={
+                    "Content-Type": "audio/flac",
+                    "Content-Length": "10",
+                    "Content-Range": "bytes 2-11/100",
+                    "Accept-Ranges": "bytes",
+                },
+            )
+        )
+
+
+class PlayerTests(unittest.TestCase):
+    def test_stream_proxy_forwards_range_and_audio(self) -> None:
+        client = _FakeStreamingClient()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        with StreamProxy(client) as proxy:
+            url = proxy.url_for("song/id")
+            request = urllib.request.Request(url, headers={"Range": "bytes=2-11"})
+            with opener.open(request, timeout=2) as response:
+                self.assertEqual(response.status, 206)
+                self.assertEqual(response.headers["Content-Type"], "audio/flac")
+                self.assertEqual(response.headers["Content-Range"], "bytes 2-11/100")
+                self.assertEqual(response.read(), b"audio-data")
+
+        self.assertEqual(client.calls, [("song/id", "bytes=2-11")])
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            proxy.url_for("another-song")
+
+
+class MpvPlayerTests(unittest.TestCase):
+    def _player(self, temporary_directory: str) -> MpvPlayer:
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": temporary_directory}):
+            return MpvPlayer()
+
+    def test_start_passes_only_loopback_urls_to_mpv(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            player = self._player(temporary_directory)
+            process = mock.Mock()
+            process.poll.return_value = None
+            url = "http://127.0.0.1:12345/token/stream/song-id"
+
+            with mock.patch("tune.player.subprocess.Popen", return_value=process) as popen:
+                with mock.patch("tune.player._remove_stale_player_socket"):
+                    with mock.patch.object(Path, "exists", return_value=True):
+                        with mock.patch.object(player, "_command", return_value=False):
+                            player.start([url])
+
+            arguments = popen.call_args.args[0]
+            self.assertIn("--idle=yes", arguments)
+            self.assertIn("--gapless-audio=yes", arguments)
+            self.assertIn(url, arguments)
+            self.assertFalse(any("music.example" in value for value in arguments))
+            player._process = None
+
+    def test_start_rejects_non_loopback_url_before_spawning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            player = self._player(temporary_directory)
+            with mock.patch("tune.player.subprocess.Popen") as popen:
+                with self.assertRaisesRegex(PlayerError, "non-loopback"):
+                    player.start(["https://music.example/rest/stream.view?t=secret"])
+            popen.assert_not_called()
+
+    def test_controls_send_expected_ipc_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            player = self._player(temporary_directory)
+            with mock.patch.object(player, "_command") as command:
+                player.pause()
+                player.resume()
+                player.next_track()
+                player.previous_track()
+                player.stop()
+
+            self.assertEqual(
+                command.call_args_list,
+                [
+                    mock.call(["set_property", "pause", True]),
+                    mock.call(["set_property", "pause", False]),
+                    mock.call(["playlist-next", "force"]),
+                    mock.call(["playlist-prev", "force"]),
+                    mock.call(["stop"]),
+                ],
+            )
+
+    def test_close_quits_and_reaps_mpv(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            player = self._player(temporary_directory)
+            process = mock.Mock()
+            process.poll.return_value = None
+            player._process = process
+
+            with mock.patch.object(player, "_command") as command:
+                with mock.patch("tune.player._remove_stale_player_socket") as remove:
+                    player.close()
+
+            command.assert_called_once_with(["quit"])
+            process.wait.assert_called_once_with(timeout=2)
+            remove.assert_called_once_with(player._socket_path)
+            self.assertIsNone(player._process)
+
+
 class _FakeSubsonicClient:
     instances: list[_FakeSubsonicClient] = []
 
@@ -208,9 +432,55 @@ class _FakeSubsonicClient:
     def search_albums(self, query: str, *, limit: int, offset: int) -> list[Album]:
         return [Album("search-album-id", "Amnesiac", "Radiohead", 2001, 11)]
 
+    def get_album(self, album_id: str) -> list[Song]:
+        return [
+            Song("song-1", "Everything in Its Right Place", "Radiohead", "Kid A", 1, 1, 251),
+            Song("song-2", "Kid A", "Radiohead", "Kid A", 2, 1, 284),
+        ]
+
     def wipe_credentials(self) -> None:
         self.password = ""
         self.wiped = True
+
+
+class _FakeStreamProxy:
+    def __init__(self, client: _FakeSubsonicClient) -> None:
+        self.client = client
+        self.closed = False
+
+    def url_for(self, song_id: str) -> str:
+        return f"http://127.0.0.1:12345/token/stream/{song_id}"
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakePlayer:
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+        self.actions: list[str] = []
+        self.closed = False
+
+    def start(self, urls: list[str]) -> None:
+        self.urls = urls
+
+    def pause(self) -> None:
+        self.actions.append("pause")
+
+    def resume(self) -> None:
+        self.actions.append("resume")
+
+    def next_track(self) -> None:
+        self.actions.append("next")
+
+    def previous_track(self) -> None:
+        self.actions.append("previous")
+
+    def stop(self) -> None:
+        self.actions.append("stop")
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class DaemonTests(unittest.TestCase):
@@ -226,7 +496,11 @@ class DaemonTests(unittest.TestCase):
             "password": "swordfish",
         }
 
-        with mock.patch("tune.daemon.SubsonicClient", _FakeSubsonicClient):
+        with (
+            mock.patch("tune.daemon.SubsonicClient", _FakeSubsonicClient),
+            mock.patch("tune.daemon.StreamProxy", _FakeStreamProxy),
+            mock.patch("tune.daemon.MpvPlayer", _FakePlayer),
+        ):
             connected = daemon._handle_request(request)
             albums = daemon._handle_request(
                 {
@@ -236,6 +510,13 @@ class DaemonTests(unittest.TestCase):
                     "offset": 0,
                 }
             )
+            played = daemon._handle_request({"command": "play", "number": 1})
+            player = daemon.player
+            proxy = daemon.stream_proxy
+            controls = [
+                daemon._handle_request({"command": command})
+                for command in ("pause", "resume", "next", "previous", "stop")
+            ]
             search = daemon._handle_request(
                 {
                     "command": "search",
@@ -254,6 +535,21 @@ class DaemonTests(unittest.TestCase):
         self.assertTrue(status["connected"])
         self.assertEqual(albums["albums"][0]["number"], 1)
         self.assertNotIn("id", albums["albums"][0])
+        self.assertEqual(played["first_song"], "Everything in Its Right Place")
+        self.assertEqual(
+            player.urls,
+            [
+                "http://127.0.0.1:12345/token/stream/song-1",
+                "http://127.0.0.1:12345/token/stream/song-2",
+            ],
+        )
+        self.assertEqual(
+            [response["action"] for response in controls],
+            ["pause", "resume", "next", "previous", "stop"],
+        )
+        self.assertEqual(player.actions, ["pause", "resume", "next", "previous", "stop"])
+        self.assertTrue(player.closed)
+        self.assertTrue(proxy.closed)
         self.assertEqual(search["albums"][0]["name"], "Amnesiac")
         self.assertEqual(cached_album_id, "search-album-id")
         self.assertTrue(disconnected["ok"])
@@ -303,6 +599,47 @@ class CLITests(unittest.TestCase):
                 "offset": 5,
             }
         )
+
+    def test_play_sends_number_and_prints_metadata(self) -> None:
+        response = {
+            "ok": True,
+            "album": "Kid A",
+            "artist": "Radiohead",
+            "song_count": 10,
+            "first_song": "Everything in Its Right Place",
+        }
+        output = io.StringIO()
+
+        with mock.patch("tune.cli._send_request", return_value=response) as send:
+            with redirect_stdout(output):
+                result = cli._command_play(argparse.Namespace(number=3))
+
+        self.assertEqual(result, 0)
+        send.assert_called_once_with({"command": "play", "number": 3})
+        self.assertEqual(
+            output.getvalue(),
+            "Playing Radiohead — Kid A (10 tracks); first: Everything in Its Right Place\n",
+        )
+
+    def test_playback_control_sends_action(self) -> None:
+        arguments = argparse.Namespace(action="pause", confirmation="Paused")
+        output = io.StringIO()
+
+        with mock.patch(
+            "tune.cli._send_request",
+            return_value={"ok": True, "action": "pause"},
+        ) as send:
+            with redirect_stdout(output):
+                result = cli._command_playback_control(arguments)
+
+        self.assertEqual(result, 0)
+        send.assert_called_once_with({"command": "pause"})
+        self.assertEqual(output.getvalue(), "Paused\n")
+
+    def test_album_number_must_be_positive(self) -> None:
+        self.assertEqual(cli._album_number("1"), 1)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            cli._album_number("0")
 
     def test_album_limit_is_bounded(self) -> None:
         self.assertEqual(cli._album_limit("500"), 500)

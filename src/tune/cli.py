@@ -232,6 +232,39 @@ def _display_albums(response: dict[str, Any]) -> int:
     return 0
 
 
+def _command_play(args: argparse.Namespace) -> int:
+    response = _require_success(
+        _send_request({"command": "play", "number": args.number})
+    )
+    album = response.get("album")
+    artist = response.get("artist")
+    song_count = response.get("song_count")
+    first_song = response.get("first_song")
+    if (
+        not isinstance(album, str)
+        or not isinstance(artist, str)
+        or not isinstance(song_count, int)
+        or isinstance(song_count, bool)
+        or not isinstance(first_song, str)
+    ):
+        raise CLIError("daemon returned invalid playback metadata")
+
+    noun = "track" if song_count == 1 else "tracks"
+    print(
+        f"Playing {_terminal_safe(artist)} — {_terminal_safe(album)} "
+        f"({song_count} {noun}); first: {_terminal_safe(first_song)}"
+    )
+    return 0
+
+
+def _command_playback_control(args: argparse.Namespace) -> int:
+    response = _require_success(_send_request({"command": args.action}))
+    if response.get("action") != args.action:
+        raise CLIError("daemon returned an invalid playback response")
+    print(args.confirmation)
+    return 0
+
+
 def _command_disconnect(_args: argparse.Namespace) -> int:
     try:
         _require_success(_send_request({"command": "disconnect"}))
@@ -241,6 +274,16 @@ def _command_disconnect(_args: argparse.Namespace) -> int:
 
     print("Disconnected")
     return 0
+
+
+def _album_number(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be an integer") from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
 
 
 def _album_limit(value: str) -> int:
@@ -289,6 +332,25 @@ def _build_parser() -> argparse.ArgumentParser:
     search.add_argument("--limit", type=_album_limit, default=100, help="number to show (1-500)")
     search.add_argument("--offset", type=_album_offset, default=0, help="number to skip")
     search.set_defaults(handler=_command_search)
+
+    play = subparsers.add_parser("play", help="play an album from the last results")
+    play.add_argument("number", type=_album_number, help="album result number")
+    play.set_defaults(handler=_command_play)
+
+    playback_commands = {
+        "pause": ("pause playback", "Paused"),
+        "resume": ("resume playback", "Resumed"),
+        "next": ("skip to the next track", "Skipped to next track"),
+        "previous": ("return to the previous track", "Returned to previous track"),
+        "stop": ("stop playback", "Stopped"),
+    }
+    for command, (help_text, confirmation) in playback_commands.items():
+        control = subparsers.add_parser(command, help=help_text)
+        control.set_defaults(
+            handler=_command_playback_control,
+            action=command,
+            confirmation=confirmation,
+        )
 
     disconnect = subparsers.add_parser("disconnect", help="disconnect and stop the daemon")
     disconnect.set_defaults(handler=_command_disconnect)

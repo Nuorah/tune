@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import urllib.error
 import urllib.parse
@@ -29,6 +30,43 @@ class Album:
     artist: str
     year: int | None
     song_count: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class Song:
+    id: str
+    title: str
+    artist: str
+    album: str
+    track: int | None
+    disc: int | None
+    duration: int | None
+
+
+class AudioStream:
+    """A streaming response that does not expose its authenticated URL."""
+
+    def __init__(self, response: Any) -> None:
+        self.status = response.status
+        self.content_type = response.headers.get("Content-Type")
+        self.content_range = response.headers.get("Content-Range")
+        self.accept_ranges = response.headers.get("Accept-Ranges")
+        self.content_length = _optional_nonnegative_int(
+            response.headers.get("Content-Length")
+        )
+        self._response = response
+
+    def read(self, size: int = 64 * 1024) -> bytes:
+        return self._response.read(size)
+
+    def close(self) -> None:
+        self._response.close()
+
+    def __enter__(self) -> AudioStream:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
 
 
 class _NoRedirects(urllib.request.HTTPRedirectHandler):
@@ -91,6 +129,111 @@ class SubsonicClient:
         if not isinstance(album_list, dict):
             return []
         return _parse_albums(album_list.get("album"))
+
+    def open_stream(
+        self,
+        song_id: str,
+        *,
+        byte_range: str | None = None,
+    ) -> AudioStream:
+        """Open a song stream without exposing its authenticated request URL."""
+        song_id = song_id.strip()
+        if not song_id:
+            raise ValueError("song ID must not be empty")
+        if byte_range is not None and not _valid_byte_range(byte_range):
+            raise ValueError("invalid byte range")
+
+        headers = {"Accept": "audio/*", "User-Agent": "tune/0.1"}
+        if byte_range is not None:
+            headers["Range"] = byte_range
+        request = urllib.request.Request(
+            self._build_url("stream", {"id": song_id}),
+            headers=headers,
+        )
+
+        try:
+            response = self._opener.open(request, timeout=15)
+        except urllib.error.HTTPError as error:
+            if error.code == 416:
+                response = error
+            elif 300 <= error.code < 400:
+                raise SubsonicError("server redirects are not allowed") from None
+            else:
+                raise SubsonicError(
+                    f"server returned HTTP status {error.code} for audio stream"
+                ) from None
+        except urllib.error.URLError:
+            raise SubsonicError("could not securely reach the audio stream") from None
+        except TimeoutError:
+            raise SubsonicError("connection to the audio stream timed out") from None
+
+        if response.status not in {200, 206, 416}:
+            response.close()
+            raise SubsonicError(
+                f"server returned HTTP status {response.status} for audio stream"
+            )
+        content_type = response.headers.get("Content-Type", "")
+        if response.status != 416 and (
+            content_type.startswith("application/json")
+            or content_type.startswith("application/xml")
+            or content_type.startswith("text/")
+        ):
+            response.close()
+            raise SubsonicError("server returned a non-audio stream response")
+        return AudioStream(response)
+
+    def get_album(self, album_id: str) -> list[Song]:
+        """Return an album's songs in the order supplied by the server."""
+        album_id = album_id.strip()
+        if not album_id:
+            raise ValueError("album ID must not be empty")
+
+        payload = self._request("getAlbum", {"id": album_id})
+        album = payload.get("album")
+        if not isinstance(album, dict):
+            raise SubsonicError("server returned an invalid album")
+
+        album_name = album.get("name")
+        album_artist = album.get("artist")
+        fallback_album = album_name if isinstance(album_name, str) else ""
+        fallback_artist = album_artist if isinstance(album_artist, str) else ""
+
+        raw_songs = album.get("song")
+        if raw_songs is None:
+            return []
+        if not isinstance(raw_songs, list):
+            raise SubsonicError("server returned an invalid song list")
+
+        songs: list[Song] = []
+        for item in raw_songs:
+            if not isinstance(item, dict):
+                raise SubsonicError("server returned an invalid song")
+            song_id = item.get("id")
+            title = item.get("title")
+            if not isinstance(song_id, str) or not isinstance(title, str):
+                raise SubsonicError("server returned a song with missing metadata")
+
+            artist = item.get("artist")
+            song_album = item.get("album")
+            track = item.get("track")
+            disc = item.get("discNumber")
+            duration = item.get("duration")
+            songs.append(
+                Song(
+                    id=song_id,
+                    title=title,
+                    artist=artist if isinstance(artist, str) else fallback_artist,
+                    album=song_album if isinstance(song_album, str) else fallback_album,
+                    track=track if isinstance(track, int) and not isinstance(track, bool) else None,
+                    disc=disc if isinstance(disc, int) and not isinstance(disc, bool) else None,
+                    duration=(
+                        duration
+                        if isinstance(duration, int) and not isinstance(duration, bool)
+                        else None
+                    ),
+                )
+            )
+        return songs
 
     def search_albums(
         self,
@@ -203,6 +346,21 @@ class SubsonicClient:
         )
         query = urllib.parse.urlencode(query_parameters)
         return f"{self.server_url}/rest/{endpoint}.view?{query}"
+
+
+def _valid_byte_range(value: str) -> bool:
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", value)
+    return match is not None and bool(match.group(1) or match.group(2))
+
+
+def _optional_nonnegative_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
 
 
 def _parse_albums(raw_albums: Any) -> list[Album]:
