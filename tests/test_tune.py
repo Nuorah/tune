@@ -381,6 +381,7 @@ class MpvPlayerTests(unittest.TestCase):
             with mock.patch.object(player, "_command") as command:
                 player.pause()
                 player.resume()
+                player.toggle_pause()
                 player.next_track()
                 player.previous_track()
                 player.stop()
@@ -390,6 +391,7 @@ class MpvPlayerTests(unittest.TestCase):
                 [
                     mock.call(["set_property", "pause", True]),
                     mock.call(["set_property", "pause", False]),
+                    mock.call(["cycle", "pause"]),
                     mock.call(["playlist-next", "force"]),
                     mock.call(["playlist-prev", "force"]),
                     mock.call(["stop"]),
@@ -516,6 +518,10 @@ class _FakePlayer:
         self.actions.append("resume")
         self.paused = False
 
+    def toggle_pause(self) -> None:
+        self.actions.append("toggle")
+        self.paused = not self.paused
+
     def next_track(self) -> None:
         self.actions.append("next")
         self.playlist_index += 1
@@ -570,7 +576,7 @@ class DaemonTests(unittest.TestCase):
             playing_status = daemon._handle_request({"command": "status"})
             controls = [
                 daemon._handle_request({"command": command})
-                for command in ("pause", "resume", "next", "previous", "stop")
+                for command in ("pause", "resume", "toggle", "next", "previous", "stop")
             ]
             search = daemon._handle_request(
                 {
@@ -614,9 +620,12 @@ class DaemonTests(unittest.TestCase):
         )
         self.assertEqual(
             [response["action"] for response in controls],
-            ["pause", "resume", "next", "previous", "stop"],
+            ["pause", "resume", "toggle", "next", "previous", "stop"],
         )
-        self.assertEqual(player.actions, ["pause", "resume", "next", "previous", "stop"])
+        self.assertEqual(
+            player.actions,
+            ["pause", "resume", "toggle", "next", "previous", "stop"],
+        )
         self.assertTrue(player.closed)
         self.assertTrue(proxy.closed)
         self.assertEqual(search["albums"][0]["name"], "Amnesiac")
@@ -657,6 +666,64 @@ class CLITests(unittest.TestCase):
             "Connected to https://music.example as alice\n"
             "Paused 6/10: Radiohead — Optimistic (Kid A) [1:02 / 5:15]\n",
         )
+
+    def test_waybar_prints_active_playback_json(self) -> None:
+        response = {
+            "ok": True,
+            "connected": True,
+            "playback": {
+                "state": "playing",
+                "artist": "Radiohead",
+                "album": "Kid A",
+                "title": "Optimistic",
+                "number": 6,
+                "total": 10,
+                "position": 62.9,
+                "duration": 315.0,
+            },
+        }
+        output = io.StringIO()
+
+        with mock.patch("tune.cli._send_request", return_value=response):
+            with redirect_stdout(output):
+                result = cli._command_waybar(argparse.Namespace())
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "text": "Radiohead — Optimistic [1:02 / 5:15]",
+                "tooltip": "Kid A\nTrack 6 of 10",
+                "class": "playing",
+                "percentage": 20,
+            },
+        )
+
+    def test_waybar_watch_streams_and_waits_for_interval(self) -> None:
+        payload = {"text": "Playback stopped", "class": "stopped"}
+        arguments = argparse.Namespace(watch=True, interval=0.25)
+        output = io.StringIO()
+
+        with mock.patch("tune.cli._read_waybar_payload", return_value=payload):
+            with mock.patch("tune.cli.time.sleep", side_effect=KeyboardInterrupt) as sleep:
+                with redirect_stdout(output):
+                    with self.assertRaises(KeyboardInterrupt):
+                        cli._command_waybar(arguments)
+
+        self.assertEqual(json.loads(output.getvalue()), payload)
+        sleep.assert_called_once_with(0.25)
+
+    def test_waybar_prints_json_when_daemon_is_absent(self) -> None:
+        output = io.StringIO()
+
+        with mock.patch("tune.cli._send_request", side_effect=FileNotFoundError()):
+            with redirect_stdout(output):
+                result = cli._command_waybar(argparse.Namespace())
+
+        self.assertEqual(result, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["text"], "Tune unavailable")
+        self.assertEqual(payload["class"], "disconnected")
 
     def test_albums_prints_numbered_sanitized_results(self) -> None:
         response = {
@@ -734,6 +801,11 @@ class CLITests(unittest.TestCase):
         self.assertEqual(result, 0)
         send.assert_called_once_with({"command": "pause"})
         self.assertEqual(output.getvalue(), "Paused\n")
+
+    def test_waybar_interval_is_bounded(self) -> None:
+        self.assertEqual(cli._waybar_interval("0.1"), 0.1)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            cli._waybar_interval("0.09")
 
     def test_album_number_must_be_positive(self) -> None:
         self.assertEqual(cli._album_number("1"), 1)

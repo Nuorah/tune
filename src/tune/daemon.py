@@ -91,7 +91,7 @@ class TuneDaemon:
             return self._search(request)
         if command == "play":
             return self._play(request)
-        if command in {"pause", "resume", "next", "previous", "stop"}:
+        if command in {"pause", "resume", "toggle", "next", "previous", "stop"}:
             return self._playback_control(command)
         if command == "disconnect":
             return self._disconnect()
@@ -264,6 +264,8 @@ class TuneDaemon:
             self.player.pause()
         elif command == "resume":
             self.player.resume()
+        elif command == "toggle":
+            self.player.toggle_pause()
         elif command == "next":
             self.player.next_track()
         elif command == "previous":

@@ -147,12 +147,13 @@ The album queue is sent to a headless mpv process through randomized loopback pr
 ```console
 tune pause
 tune resume
+tune toggle
 tune next
 tune previous
 tune stop
 ```
 
-`stop` stops playback but leaves the authenticated session and daemon running.
+`toggle` switches between paused and playing states. `stop` stops playback but leaves the authenticated session and daemon running.
 
 ### Status
 
@@ -167,6 +168,36 @@ Example:
 ```text
 Connected to https://music.example.com as alice
 Playing 3/10: Artist — Track Title (Album) [1:42 / 4:15]
+```
+
+### Waybar
+
+Print one Waybar-compatible JSON status object:
+
+```console
+tune waybar
+```
+
+The object includes display text, a tooltip, a CSS class for the current state, and playback percentage when timing information is available. Classes are `playing`, `paused`, `stopped`, and `disconnected`.
+
+For frequent updates, use watch mode. It keeps one process running and emits newline-delimited JSON instead of starting a new Python process for every update:
+
+```console
+tune waybar --watch
+tune waybar --watch --interval 0.5
+```
+
+The default watch interval is 0.25 seconds. A Waybar custom module can consume it directly:
+
+```json
+{
+    "custom/tune": {
+        "exec": "tune waybar --watch",
+        "return-type": "json",
+        "escape": true,
+        "on-click": "tune toggle"
+    }
+}
 ```
 
 ### Disconnect

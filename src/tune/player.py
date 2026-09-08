@@ -148,6 +148,9 @@ class MpvPlayer:
     def resume(self) -> None:
         self._command(["set_property", "pause", False])
 
+    def toggle_pause(self) -> None:
+        self._command(["cycle", "pause"])
+
     def next_track(self) -> None:
         self._command(["playlist-next", "force"])
 

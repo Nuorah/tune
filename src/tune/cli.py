@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import os
 import socket
 import stat
@@ -234,6 +235,94 @@ def _format_seconds(value: int | float) -> str:
     return f"{minutes}:{seconds:02}"
 
 
+def _command_waybar(args: argparse.Namespace) -> int:
+    watch = getattr(args, "watch", False)
+    interval = getattr(args, "interval", 0.25)
+    while True:
+        payload = _read_waybar_payload()
+        try:
+            print(json.dumps(payload, ensure_ascii=False), flush=watch)
+        except BrokenPipeError:
+            return 0
+        if not watch:
+            return 0
+        time.sleep(interval)
+
+
+def _read_waybar_payload() -> dict[str, Any]:
+    try:
+        response = _require_success(_send_request({"command": "status"}))
+        return _waybar_payload(response)
+    except (CLIError, ProtocolError, RuntimeSecurityError, TimeoutError, OSError) as error:
+        detail = _terminal_safe(str(error)) or "Tune is unavailable"
+        return {
+            "text": "Tune unavailable",
+            "tooltip": detail,
+            "class": "disconnected",
+        }
+
+
+def _waybar_payload(response: dict[str, Any]) -> dict[str, Any]:
+    if response.get("connected") is not True:
+        return {
+            "text": "Tune disconnected",
+            "tooltip": "Tune is not connected",
+            "class": "disconnected",
+        }
+
+    playback = response.get("playback")
+    if not isinstance(playback, dict):
+        raise CLIError("daemon returned an invalid playback status")
+    state = playback.get("state")
+    if state == "stopped":
+        return {
+            "text": "Playback stopped",
+            "tooltip": "Tune is connected",
+            "class": "stopped",
+        }
+    if state not in {"playing", "paused"}:
+        raise CLIError("daemon returned an invalid playback state")
+
+    artist = playback.get("artist")
+    album = playback.get("album")
+    title = playback.get("title")
+    number = playback.get("number")
+    total = playback.get("total")
+    position = playback.get("position")
+    duration = playback.get("duration")
+    if (
+        not isinstance(artist, str)
+        or not isinstance(album, str)
+        or not isinstance(title, str)
+        or not isinstance(number, int)
+        or isinstance(number, bool)
+        or not isinstance(total, int)
+        or isinstance(total, bool)
+    ):
+        raise CLIError("daemon returned invalid current-track metadata")
+
+    timing = _format_timing(position, duration)
+    label = "Paused: " if state == "paused" else ""
+    payload: dict[str, Any] = {
+        "text": (
+            f"{label}{_terminal_safe(artist)} — {_terminal_safe(title)}{timing}"
+        ),
+        "tooltip": (
+            f"{_terminal_safe(album)}\nTrack {number} of {total}"
+        ),
+        "class": state,
+    }
+    if (
+        isinstance(position, (int, float))
+        and not isinstance(position, bool)
+        and isinstance(duration, (int, float))
+        and not isinstance(duration, bool)
+        and duration > 0
+    ):
+        payload["percentage"] = max(0, min(100, round(position / duration * 100)))
+    return payload
+
+
 def _command_albums(args: argparse.Namespace) -> int:
     response = _require_success(
         _send_request(
@@ -340,6 +429,16 @@ def _command_disconnect(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _waybar_interval(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a number") from None
+    if not 0.1 <= parsed <= 60:
+        raise argparse.ArgumentTypeError("must be between 0.1 and 60 seconds")
+    return parsed
+
+
 def _album_number(value: str) -> int:
     try:
         parsed = int(value)
@@ -385,6 +484,17 @@ def _build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="show connection status")
     status.set_defaults(handler=_command_status)
 
+    waybar = subparsers.add_parser("waybar", help="print Waybar-compatible JSON status")
+    waybar.add_argument("--watch", action="store_true", help="continuously print status updates")
+    waybar.add_argument(
+        "--interval",
+        type=_waybar_interval,
+        default=0.25,
+        metavar="SECONDS",
+        help="watch update interval (default: 0.25)",
+    )
+    waybar.set_defaults(handler=_command_waybar)
+
     albums = subparsers.add_parser("albums", help="list albums and cache numbered results")
     albums.add_argument("--newest", action="store_true", help="order newest first")
     albums.add_argument("--limit", type=_album_limit, default=100, help="number to show (1-500)")
@@ -404,6 +514,7 @@ def _build_parser() -> argparse.ArgumentParser:
     playback_commands = {
         "pause": ("pause playback", "Paused"),
         "resume": ("resume playback", "Resumed"),
+        "toggle": ("toggle pause or resume", "Toggled pause"),
         "next": ("skip to the next track", "Skipped to next track"),
         "previous": ("return to the previous track", "Returned to previous track"),
         "stop": ("stop playback", "Stopped"),
