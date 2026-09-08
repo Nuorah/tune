@@ -8,6 +8,8 @@ import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -18,6 +20,15 @@ MAX_RESPONSE_BYTES = 1024 * 1024
 
 class SubsonicError(RuntimeError):
     """A safe-to-display Subsonic connection or protocol error."""
+
+
+@dataclass(frozen=True, slots=True)
+class Album:
+    id: str
+    name: str
+    artist: str
+    year: int | None
+    song_count: int | None
 
 
 class _NoRedirects(urllib.request.HTTPRedirectHandler):
@@ -55,7 +66,69 @@ class SubsonicClient:
 
     def ping(self) -> None:
         """Authenticate with the server and verify a successful response."""
-        response = self._request_json("ping")
+        self._request("ping")
+
+    def get_albums(
+        self,
+        *,
+        order: str = "alphabeticalByName",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Album]:
+        """Return a page of albums using Subsonic's ID3 album endpoint."""
+        if order not in {"alphabeticalByName", "newest"}:
+            raise ValueError("unsupported album order")
+        if not 1 <= limit <= 500:
+            raise ValueError("album limit must be between 1 and 500")
+        if offset < 0:
+            raise ValueError("album offset must not be negative")
+
+        payload = self._request(
+            "getAlbumList2",
+            {"type": order, "size": limit, "offset": offset},
+        )
+        album_list = payload.get("albumList2")
+        if not isinstance(album_list, dict):
+            return []
+        return _parse_albums(album_list.get("album"))
+
+    def search_albums(
+        self,
+        query: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Album]:
+        """Search albums using the server's matching and ranking behavior."""
+        query = query.strip()
+        if not query:
+            raise ValueError("search query must not be empty")
+        if not 1 <= limit <= 500:
+            raise ValueError("album limit must be between 1 and 500")
+        if offset < 0:
+            raise ValueError("album offset must not be negative")
+
+        payload = self._request(
+            "search3",
+            {
+                "query": query,
+                "artistCount": 0,
+                "albumCount": limit,
+                "albumOffset": offset,
+                "songCount": 0,
+            },
+        )
+        results = payload.get("searchResult3")
+        if not isinstance(results, dict):
+            return []
+        return _parse_albums(results.get("album"))
+
+    def _request(
+        self,
+        endpoint: str,
+        parameters: Mapping[str, str | int] | None = None,
+    ) -> dict[str, Any]:
+        response = self._request_json(endpoint, parameters)
         payload = response.get("subsonic-response")
         if not isinstance(payload, dict):
             raise SubsonicError("server returned an invalid Subsonic response")
@@ -63,12 +136,17 @@ class SubsonicClient:
         if payload.get("status") != "ok":
             error = payload.get("error")
             if isinstance(error, dict) and isinstance(error.get("message"), str):
-                raise SubsonicError(f"server rejected the connection: {error['message']}")
-            raise SubsonicError("server rejected the connection")
+                raise SubsonicError(f"server rejected the request: {error['message']}")
+            raise SubsonicError("server rejected the request")
+        return payload
 
-    def _request_json(self, endpoint: str) -> dict[str, Any]:
+    def _request_json(
+        self,
+        endpoint: str,
+        parameters: Mapping[str, str | int] | None = None,
+    ) -> dict[str, Any]:
         request = urllib.request.Request(
-            self._build_url(endpoint),
+            self._build_url(endpoint, parameters),
             headers={"Accept": "application/json", "User-Agent": "tune/0.1"},
         )
 
@@ -104,11 +182,16 @@ class SubsonicClient:
             raise SubsonicError("server returned an invalid JSON response")
         return decoded
 
-    def _build_url(self, endpoint: str) -> str:
+    def _build_url(
+        self,
+        endpoint: str,
+        parameters: Mapping[str, str | int] | None = None,
+    ) -> str:
         salt = secrets.token_hex(8)
         password = bytes(self._password)
         token = hashlib.md5(password + salt.encode("ascii"), usedforsecurity=False).hexdigest()
-        query = urllib.parse.urlencode(
+        query_parameters: dict[str, str | int] = dict(parameters or {})
+        query_parameters.update(
             {
                 "u": self.username,
                 "t": token,
@@ -118,7 +201,38 @@ class SubsonicClient:
                 "f": "json",
             }
         )
+        query = urllib.parse.urlencode(query_parameters)
         return f"{self.server_url}/rest/{endpoint}.view?{query}"
+
+
+def _parse_albums(raw_albums: Any) -> list[Album]:
+    if raw_albums is None:
+        return []
+    if not isinstance(raw_albums, list):
+        raise SubsonicError("server returned an invalid album list")
+
+    albums: list[Album] = []
+    for item in raw_albums:
+        if not isinstance(item, dict):
+            raise SubsonicError("server returned an invalid album")
+        album_id = item.get("id")
+        name = item.get("name")
+        artist = item.get("artist")
+        if not all(isinstance(value, str) for value in (album_id, name, artist)):
+            raise SubsonicError("server returned an album with missing metadata")
+
+        year = item.get("year")
+        song_count = item.get("songCount")
+        albums.append(
+            Album(
+                id=album_id,
+                name=name,
+                artist=artist,
+                year=year if isinstance(year, int) else None,
+                song_count=song_count if isinstance(song_count, int) else None,
+            )
+        )
+    return albums
 
 
 def _normalize_server_url(server_url: str) -> str:

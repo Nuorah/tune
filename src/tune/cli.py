@@ -170,6 +170,68 @@ def _command_status(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _command_albums(args: argparse.Namespace) -> int:
+    response = _require_success(
+        _send_request(
+            {
+                "command": "albums",
+                "order": "newest" if args.newest else "alphabeticalByName",
+                "limit": args.limit,
+                "offset": args.offset,
+            }
+        )
+    )
+    return _display_albums(response)
+
+
+def _command_search(args: argparse.Namespace) -> int:
+    response = _require_success(
+        _send_request(
+            {
+                "command": "search",
+                "query": " ".join(args.query),
+                "limit": args.limit,
+                "offset": args.offset,
+            }
+        )
+    )
+    return _display_albums(response)
+
+
+def _display_albums(response: dict[str, Any]) -> int:
+    albums = response.get("albums")
+    if not isinstance(albums, list):
+        raise CLIError("daemon returned an invalid album list")
+    if not albums:
+        print("No albums found")
+        return 0
+
+    number_width = len(str(len(albums)))
+    for album in albums:
+        if not isinstance(album, dict):
+            raise CLIError("daemon returned an invalid album entry")
+        number = album.get("number")
+        name = album.get("name")
+        artist = album.get("artist")
+        if not isinstance(number, int) or not isinstance(name, str) or not isinstance(artist, str):
+            raise CLIError("daemon returned an album with missing metadata")
+
+        details: list[str] = []
+        year = album.get("year")
+        song_count = album.get("song_count")
+        if isinstance(year, int) and not isinstance(year, bool):
+            details.append(str(year))
+        if isinstance(song_count, int) and not isinstance(song_count, bool):
+            noun = "track" if song_count == 1 else "tracks"
+            details.append(f"{song_count} {noun}")
+        suffix = f" ({', '.join(details)})" if details else ""
+        print(
+            f"{number:>{number_width}}  "
+            f"{_terminal_safe(artist)} — {_terminal_safe(name)}{suffix}"
+        )
+    return 0
+
+
 def _command_disconnect(_args: argparse.Namespace) -> int:
     try:
         _require_success(_send_request({"command": "disconnect"}))
@@ -179,6 +241,26 @@ def _command_disconnect(_args: argparse.Namespace) -> int:
 
     print("Disconnected")
     return 0
+
+
+def _album_limit(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be an integer") from None
+    if not 1 <= parsed <= 500:
+        raise argparse.ArgumentTypeError("must be between 1 and 500")
+    return parsed
+
+
+def _album_offset(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be an integer") from None
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
+    return parsed
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -196,6 +278,18 @@ def _build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="show connection status")
     status.set_defaults(handler=_command_status)
 
+    albums = subparsers.add_parser("albums", help="list albums and cache numbered results")
+    albums.add_argument("--newest", action="store_true", help="order newest first")
+    albums.add_argument("--limit", type=_album_limit, default=100, help="number to show (1-500)")
+    albums.add_argument("--offset", type=_album_offset, default=0, help="number to skip")
+    albums.set_defaults(handler=_command_albums)
+
+    search = subparsers.add_parser("search", help="search albums and cache numbered results")
+    search.add_argument("query", nargs="+", help="album search query")
+    search.add_argument("--limit", type=_album_limit, default=100, help="number to show (1-500)")
+    search.add_argument("--offset", type=_album_offset, default=0, help="number to skip")
+    search.set_defaults(handler=_command_search)
+
     disconnect = subparsers.add_parser("disconnect", help="disconnect and stop the daemon")
     disconnect.set_defaults(handler=_command_disconnect)
     return parser
@@ -208,6 +302,13 @@ def main() -> int:
         return args.handler(args)
     except (CLIError, ProtocolError, RuntimeSecurityError) as error:
         print(f"tune: {error}", file=sys.stderr)
+        return 1
+    except TimeoutError:
+        print("tune: daemon is not responding", file=sys.stderr)
+        return 1
+    except OSError as error:
+        detail = error.strerror or "socket error"
+        print(f"tune: could not contact daemon: {detail}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("\ntune: cancelled", file=sys.stderr)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
+import io
 import json
 import os
 import socket
@@ -9,13 +11,15 @@ import tempfile
 import unittest
 import urllib.error
 import urllib.parse
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+import tune.cli as cli
 from tune.daemon import TuneDaemon
 from tune.protocol import ProtocolError, receive_message, send_message
 from tune.runtime import control_socket_path, runtime_dir
-from tune.subsonic import SubsonicClient, SubsonicError
+from tune.subsonic import Album, SubsonicClient, SubsonicError
 
 
 class RuntimeTests(unittest.TestCase):
@@ -96,6 +100,76 @@ class SubsonicTests(unittest.TestCase):
         self.assertEqual(query["t"], [expected])
         self.assertNotIn("swordfish", opener.request_url)
 
+    def test_get_albums_parses_metadata_and_pagination(self) -> None:
+        body = json.dumps(
+            {
+                "subsonic-response": {
+                    "status": "ok",
+                    "albumList2": {
+                        "album": [
+                            {
+                                "id": "album-secret-id",
+                                "name": "Kid A",
+                                "artist": "Radiohead",
+                                "year": 2000,
+                                "songCount": 10,
+                            }
+                        ]
+                    },
+                }
+            }
+        ).encode()
+        opener = _FakeOpener(_FakeResponse(body))
+        client = SubsonicClient("https://music.example", "alice", "swordfish")
+        client._opener = opener  # type: ignore[assignment]
+
+        albums = client.get_albums(order="newest", limit=25, offset=50)
+
+        self.assertEqual(
+            albums,
+            [Album("album-secret-id", "Kid A", "Radiohead", 2000, 10)],
+        )
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(opener.request_url).query)
+        self.assertEqual(query["type"], ["newest"])
+        self.assertEqual(query["size"], ["25"])
+        self.assertEqual(query["offset"], ["50"])
+
+    def test_search_albums_uses_server_side_search(self) -> None:
+        body = json.dumps(
+            {
+                "subsonic-response": {
+                    "status": "ok",
+                    "searchResult3": {
+                        "album": [
+                            {
+                                "id": "search-album-id",
+                                "name": "Amnesiac",
+                                "artist": "Radiohead",
+                                "year": 2001,
+                                "songCount": 11,
+                            }
+                        ]
+                    },
+                }
+            }
+        ).encode()
+        opener = _FakeOpener(_FakeResponse(body))
+        client = SubsonicClient("https://music.example", "alice", "swordfish")
+        client._opener = opener  # type: ignore[assignment]
+
+        albums = client.search_albums("radio head", limit=20, offset=5)
+
+        self.assertEqual(
+            albums,
+            [Album("search-album-id", "Amnesiac", "Radiohead", 2001, 11)],
+        )
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(opener.request_url).query)
+        self.assertEqual(query["query"], ["radio head"])
+        self.assertEqual(query["artistCount"], ["0"])
+        self.assertEqual(query["albumCount"], ["20"])
+        self.assertEqual(query["albumOffset"], ["5"])
+        self.assertEqual(query["songCount"], ["0"])
+
     def test_http_is_rejected(self) -> None:
         with self.assertRaisesRegex(SubsonicError, "must use HTTPS"):
             SubsonicClient("http://music.example", "alice", "password")
@@ -128,6 +202,12 @@ class _FakeSubsonicClient:
     def ping(self) -> None:
         return None
 
+    def get_albums(self, *, order: str, limit: int, offset: int) -> list[Album]:
+        return [Album("album-secret-id", "Kid A", "Radiohead", 2000, 10)]
+
+    def search_albums(self, query: str, *, limit: int, offset: int) -> list[Album]:
+        return [Album("search-album-id", "Amnesiac", "Radiohead", 2001, 11)]
+
     def wipe_credentials(self) -> None:
         self.password = ""
         self.wiped = True
@@ -148,17 +228,86 @@ class DaemonTests(unittest.TestCase):
 
         with mock.patch("tune.daemon.SubsonicClient", _FakeSubsonicClient):
             connected = daemon._handle_request(request)
+            albums = daemon._handle_request(
+                {
+                    "command": "albums",
+                    "order": "newest",
+                    "limit": 25,
+                    "offset": 0,
+                }
+            )
+            search = daemon._handle_request(
+                {
+                    "command": "search",
+                    "query": "radio head",
+                    "limit": 20,
+                    "offset": 0,
+                }
+            )
             status = daemon._handle_request({"command": "status"})
+            cached_album_id = daemon.last_albums[0].id
             disconnected = daemon._handle_request({"command": "disconnect"})
 
         client = _FakeSubsonicClient.instances[0]
         self.assertTrue(connected["ok"])
         self.assertEqual(request["password"], "")
         self.assertTrue(status["connected"])
+        self.assertEqual(albums["albums"][0]["number"], 1)
+        self.assertNotIn("id", albums["albums"][0])
+        self.assertEqual(search["albums"][0]["name"], "Amnesiac")
+        self.assertEqual(cached_album_id, "search-album-id")
         self.assertTrue(disconnected["ok"])
         self.assertTrue(client.wiped)
         self.assertIsNone(daemon.client)
         self.assertTrue(daemon.stop_requested)
+
+
+class CLITests(unittest.TestCase):
+    def test_albums_prints_numbered_sanitized_results(self) -> None:
+        response = {
+            "ok": True,
+            "albums": [
+                {
+                    "number": 1,
+                    "name": "Kid A\x1b[31m",
+                    "artist": "Radiohead",
+                    "year": 2000,
+                    "song_count": 10,
+                }
+            ],
+        }
+        arguments = argparse.Namespace(newest=False, limit=100, offset=0)
+        output = io.StringIO()
+
+        with mock.patch("tune.cli._send_request", return_value=response):
+            with redirect_stdout(output):
+                result = cli._command_albums(arguments)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue(), "1  Radiohead — Kid A[31m (2000, 10 tracks)\n")
+
+    def test_search_joins_query_words(self) -> None:
+        response = {"ok": True, "albums": []}
+        arguments = argparse.Namespace(query=["radio", "head"], limit=20, offset=5)
+
+        with mock.patch("tune.cli._send_request", return_value=response) as send:
+            with redirect_stdout(io.StringIO()):
+                result = cli._command_search(arguments)
+
+        self.assertEqual(result, 0)
+        send.assert_called_once_with(
+            {
+                "command": "search",
+                "query": "radio head",
+                "limit": 20,
+                "offset": 5,
+            }
+        )
+
+    def test_album_limit_is_bounded(self) -> None:
+        self.assertEqual(cli._album_limit("500"), 500)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            cli._album_limit("501")
 
 
 if __name__ == "__main__":

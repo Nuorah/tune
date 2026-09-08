@@ -12,12 +12,13 @@ from typing import Any
 
 from tune.protocol import ProtocolError, receive_message, send_message
 from tune.runtime import RuntimeSecurityError, control_socket_path
-from tune.subsonic import SubsonicClient, SubsonicError
+from tune.subsonic import Album, SubsonicClient, SubsonicError
 
 
 class TuneDaemon:
     def __init__(self) -> None:
         self.client: SubsonicClient | None = None
+        self.last_albums: list[Album] = []
         self.stop_requested = False
         self.listener: socket.socket | None = None
         self.socket_path: Path | None = None
@@ -80,6 +81,10 @@ class TuneDaemon:
             return self._connect(request)
         if command == "status":
             return self._status()
+        if command == "albums":
+            return self._albums(request)
+        if command == "search":
+            return self._search(request)
         if command == "disconnect":
             return self._disconnect()
         raise ValueError("unknown command")
@@ -106,6 +111,7 @@ class TuneDaemon:
         if self.client is not None:
             self.client.wipe_credentials()
         self.client = candidate
+        self.last_albums = []
         return {
             "ok": True,
             "server": candidate.server_url,
@@ -122,10 +128,61 @@ class TuneDaemon:
             "username": self.client.username,
         }
 
+    def _albums(self, request: dict[str, Any]) -> dict[str, Any]:
+        if self.client is None:
+            raise ValueError("not connected")
+
+        order = request.get("order", "alphabeticalByName")
+        limit = request.get("limit", 100)
+        offset = request.get("offset", 0)
+        if not isinstance(order, str):
+            raise ValueError("album order must be a string")
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise ValueError("album limit must be an integer")
+        if not isinstance(offset, int) or isinstance(offset, bool):
+            raise ValueError("album offset must be an integer")
+
+        albums = self.client.get_albums(order=order, limit=limit, offset=offset)
+        return self._cache_album_response(albums)
+
+    def _search(self, request: dict[str, Any]) -> dict[str, Any]:
+        if self.client is None:
+            raise ValueError("not connected")
+
+        query = request.get("query")
+        limit = request.get("limit", 100)
+        offset = request.get("offset", 0)
+        if not isinstance(query, str):
+            raise ValueError("search query must be a string")
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise ValueError("album limit must be an integer")
+        if not isinstance(offset, int) or isinstance(offset, bool):
+            raise ValueError("album offset must be an integer")
+
+        albums = self.client.search_albums(query, limit=limit, offset=offset)
+        return self._cache_album_response(albums)
+
+    def _cache_album_response(self, albums: list[Album]) -> dict[str, Any]:
+        self.last_albums = albums
+        return {
+            "ok": True,
+            "albums": [
+                {
+                    "number": number,
+                    "name": album.name,
+                    "artist": album.artist,
+                    "year": album.year,
+                    "song_count": album.song_count,
+                }
+                for number, album in enumerate(albums, start=1)
+            ],
+        }
+
     def _disconnect(self) -> dict[str, Any]:
         if self.client is not None:
             self.client.wipe_credentials()
             self.client = None
+        self.last_albums = []
         self.stop_requested = True
         return {"ok": True}
 
