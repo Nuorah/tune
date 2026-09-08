@@ -7,7 +7,7 @@ name = "tune-subsonic"
 version = "0.1.0"
 description = "A small, session-based CLI music client for Subsonic servers"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = { text = "CC0-1.0" }
 authors = [{ name = "tune contributors" }]
 dependencies = []
 
