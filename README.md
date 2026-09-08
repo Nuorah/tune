@@ -246,6 +246,8 @@ The project currently has no runtime Python dependencies outside the standard li
 2. Add playlist creation and management.
 3. Add local file playback.
 4. Add support for other server protocols.
+5. Add native MPRIS integration for `playerctl` and desktop media controls.
+6. Rewrite in Rust then in Zig
 
 ## Public domain
 
