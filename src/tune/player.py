@@ -23,6 +23,7 @@ from tune.subsonic import AudioStream, SubsonicClient, SubsonicError
 COPY_BUFFER_SIZE = 64 * 1024
 MPV_START_TIMEOUT = 3.0
 MPV_COMMAND_TIMEOUT = 2.0
+DEFAULT_VOLUME = 50
 
 
 class PlayerError(RuntimeError):
@@ -83,10 +84,11 @@ class StreamProxy:
 class MpvPlayer:
     """Own and control one isolated, headless mpv process."""
 
-    def __init__(self, executable: str = "mpv") -> None:
+    def __init__(self, executable: str = "mpv", volume: int = DEFAULT_VOLUME) -> None:
         self._executable = executable
         self._process: subprocess.Popen[bytes] | None = None
         self._socket_path = player_socket_path()
+        self._volume = _validate_volume(volume)
 
     def start(self, urls: list[str]) -> None:
         if not urls:
@@ -105,6 +107,7 @@ class MpvPlayer:
             "--really-quiet",
             "--idle=yes",
             "--gapless-audio=yes",
+            f"--volume={self._volume}",
             f"--input-ipc-server={self._socket_path}",
             "--",
             *urls,
@@ -141,6 +144,12 @@ class MpvPlayer:
 
         self.close()
         raise PlayerError("timed out while starting mpv")
+
+    def set_volume(self, volume: int) -> None:
+        volume = _validate_volume(volume)
+        if self._process is not None and self._process.poll() is None:
+            self._command(["set_property", "volume", volume])
+        self._volume = volume
 
     def pause(self) -> None:
         self._command(["set_property", "pause", True])
@@ -231,6 +240,12 @@ class MpvPlayer:
         if response.get("error") != "success":
             raise PlayerError(f"mpv rejected {command[0]}")
         return response.get("data")
+
+
+def _validate_volume(volume: int) -> int:
+    if not isinstance(volume, int) or isinstance(volume, bool) or not 0 <= volume <= 100:
+        raise PlayerError("volume must be an integer between 0 and 100")
+    return volume
 
 
 def _is_loopback_stream_url(value: str) -> bool:

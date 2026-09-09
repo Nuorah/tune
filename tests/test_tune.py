@@ -363,6 +363,7 @@ class MpvPlayerTests(unittest.TestCase):
             arguments = popen.call_args.args[0]
             self.assertIn("--idle=yes", arguments)
             self.assertIn("--gapless-audio=yes", arguments)
+            self.assertIn("--volume=50", arguments)
             self.assertIn(url, arguments)
             self.assertFalse(any("music.example" in value for value in arguments))
             player._process = None
@@ -374,6 +375,25 @@ class MpvPlayerTests(unittest.TestCase):
                 with self.assertRaisesRegex(PlayerError, "non-loopback"):
                     player.start(["https://music.example/rest/stream.view?t=secret"])
             popen.assert_not_called()
+
+    def test_set_volume_updates_running_player_and_retains_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            player = self._player(temporary_directory)
+            process = mock.Mock()
+            process.poll.return_value = None
+            player._process = process
+
+            with mock.patch.object(player, "_command") as command:
+                player.set_volume(35)
+
+            command.assert_called_once_with(["set_property", "volume", 35])
+            self.assertEqual(player._volume, 35)
+
+            player._process = None
+            player.set_volume(20)
+            self.assertEqual(player._volume, 20)
+            with self.assertRaisesRegex(PlayerError, "between 0 and 100"):
+                player.set_volume(101)
 
     def test_controls_send_expected_ipc_commands(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -499,8 +519,10 @@ class _FakeStreamProxy:
 
 
 class _FakePlayer:
-    def __init__(self) -> None:
+    def __init__(self, volume: int = 50) -> None:
         self.urls: list[str] = []
+        self.volume = volume
+        self.volume_updates: list[int] = []
         self.actions: list[str] = []
         self.paused = False
         self.stopped = False
@@ -509,6 +531,10 @@ class _FakePlayer:
 
     def start(self, urls: list[str]) -> None:
         self.urls = urls
+
+    def set_volume(self, volume: int) -> None:
+        self.volume = volume
+        self.volume_updates.append(volume)
 
     def pause(self) -> None:
         self.actions.append("pause")
@@ -570,8 +596,14 @@ class DaemonTests(unittest.TestCase):
                     "offset": 0,
                 }
             )
+            initial_volume = daemon._handle_request(
+                {"command": "volume", "volume": 35}
+            )
             played = daemon._handle_request({"command": "play", "number": 1})
             player = daemon.player
+            changed_volume = daemon._handle_request(
+                {"command": "volume", "volume": 40}
+            )
             proxy = daemon.stream_proxy
             playing_status = daemon._handle_request({"command": "status"})
             controls = [
@@ -611,6 +643,10 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual(albums["albums"][0]["number"], 1)
         self.assertNotIn("id", albums["albums"][0])
         self.assertEqual(played["first_song"], "Everything in Its Right Place")
+        self.assertEqual(initial_volume["volume"], 35)
+        self.assertEqual(changed_volume["volume"], 40)
+        self.assertEqual(player.volume, 40)
+        self.assertEqual(player.volume_updates, [40])
         self.assertEqual(
             player.urls,
             [
@@ -787,6 +823,20 @@ class CLITests(unittest.TestCase):
             "Playing Radiohead — Kid A (10 tracks); first: Everything in Its Right Place\n",
         )
 
+    def test_volume_sends_percentage_and_prints_confirmation(self) -> None:
+        output = io.StringIO()
+
+        with mock.patch(
+            "tune.cli._send_request",
+            return_value={"ok": True, "volume": 35},
+        ) as send:
+            with redirect_stdout(output):
+                result = cli._command_volume(argparse.Namespace(volume=35))
+
+        self.assertEqual(result, 0)
+        send.assert_called_once_with({"command": "volume", "volume": 35})
+        self.assertEqual(output.getvalue(), "Volume set to 35%\n")
+
     def test_playback_control_sends_action(self) -> None:
         arguments = argparse.Namespace(action="pause", confirmation="Paused")
         output = io.StringIO()
@@ -806,6 +856,12 @@ class CLITests(unittest.TestCase):
         self.assertEqual(cli._waybar_interval("0.1"), 0.1)
         with self.assertRaises(argparse.ArgumentTypeError):
             cli._waybar_interval("0.09")
+
+    def test_volume_is_bounded(self) -> None:
+        self.assertEqual(cli._volume("0"), 0)
+        self.assertEqual(cli._volume("100"), 100)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            cli._volume("101")
 
     def test_album_number_must_be_positive(self) -> None:
         self.assertEqual(cli._album_number("1"), 1)

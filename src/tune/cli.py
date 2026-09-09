@@ -410,6 +410,17 @@ def _command_play(args: argparse.Namespace) -> int:
     return 0
 
 
+def _command_volume(args: argparse.Namespace) -> int:
+    response = _require_success(
+        _send_request({"command": "volume", "volume": args.volume})
+    )
+    volume = response.get("volume")
+    if not isinstance(volume, int) or isinstance(volume, bool) or not 0 <= volume <= 100:
+        raise CLIError("daemon returned an invalid volume")
+    print(f"Volume set to {volume}%")
+    return 0
+
+
 def _command_playback_control(args: argparse.Namespace) -> int:
     response = _require_success(_send_request({"command": args.action}))
     if response.get("action") != args.action:
@@ -427,6 +438,16 @@ def _command_disconnect(_args: argparse.Namespace) -> int:
 
     print("Disconnected")
     return 0
+
+
+def _volume(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be an integer") from None
+    if not 0 <= parsed <= 100:
+        raise argparse.ArgumentTypeError("must be between 0 and 100")
+    return parsed
 
 
 def _waybar_interval(value: str) -> float:
@@ -510,6 +531,10 @@ def _build_parser() -> argparse.ArgumentParser:
     play = subparsers.add_parser("play", help="play an album from the last results")
     play.add_argument("number", type=_album_number, help="album result number")
     play.set_defaults(handler=_command_play)
+
+    volume = subparsers.add_parser("volume", help="set Tune playback volume")
+    volume.add_argument("volume", type=_volume, metavar="PERCENT", help="volume from 0 to 100")
+    volume.set_defaults(handler=_command_volume)
 
     playback_commands = {
         "pause": ("pause playback", "Paused"),

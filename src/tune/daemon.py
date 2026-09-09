@@ -10,7 +10,7 @@ import struct
 from pathlib import Path
 from typing import Any
 
-from tune.player import MpvPlayer, PlayerError, StreamProxy
+from tune.player import DEFAULT_VOLUME, MpvPlayer, PlayerError, StreamProxy
 from tune.protocol import ProtocolError, receive_message, send_message
 from tune.runtime import RuntimeSecurityError, control_socket_path
 from tune.subsonic import Album, Song, SubsonicClient, SubsonicError
@@ -21,6 +21,7 @@ class TuneDaemon:
         self.client: SubsonicClient | None = None
         self.last_albums: list[Album] = []
         self.player: MpvPlayer | None = None
+        self.volume = DEFAULT_VOLUME
         self.stream_proxy: StreamProxy | None = None
         self.playlist: list[Song] = []
         self.stop_requested = False
@@ -91,6 +92,8 @@ class TuneDaemon:
             return self._search(request)
         if command == "play":
             return self._play(request)
+        if command == "volume":
+            return self._set_volume(request)
         if command in {"pause", "resume", "toggle", "next", "previous", "stop"}:
             return self._playback_control(command)
         if command == "disconnect":
@@ -235,7 +238,7 @@ class TuneDaemon:
                 raise PlayerError("could not start local stream proxy") from None
             created_proxy = True
         if self.player is None:
-            self.player = MpvPlayer()
+            self.player = MpvPlayer(volume=self.volume)
 
         urls = [self.stream_proxy.url_for(song.id) for song in songs]
         try:
@@ -255,6 +258,18 @@ class TuneDaemon:
             "song_count": len(songs),
             "first_song": first.title,
         }
+
+    def _set_volume(self, request: dict[str, Any]) -> dict[str, Any]:
+        if self.client is None:
+            raise ValueError("not connected")
+
+        volume = request.get("volume")
+        if not isinstance(volume, int) or isinstance(volume, bool) or not 0 <= volume <= 100:
+            raise ValueError("volume must be an integer between 0 and 100")
+        if self.player is not None:
+            self.player.set_volume(volume)
+        self.volume = volume
+        return {"ok": True, "volume": volume}
 
     def _playback_control(self, command: str) -> dict[str, Any]:
         if self.player is None:

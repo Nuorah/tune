@@ -148,12 +148,13 @@ The album queue is sent to a headless mpv process through randomized loopback pr
 tune pause
 tune resume
 tune toggle
+tune volume 50
 tune next
 tune previous
 tune stop
 ```
 
-`toggle` switches between paused and playing states. `stop` stops playback but leaves the authenticated session and daemon running.
+`toggle` switches between paused and playing states. `volume` sets Tune's mpv software volume from 0 to 100 without changing the system volume. Playback starts at 50% by default, and a changed value is retained in daemon memory until disconnect. `stop` stops playback but leaves the authenticated session and daemon running.
 
 ### Status
 
