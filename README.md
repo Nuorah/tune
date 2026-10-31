@@ -2,6 +2,8 @@
 
 `tune` is a command-line music client for Subsonic-compatible servers such as Navidrome. It uses a small background daemon to retain an authenticated session and control playback across separate command invocations.
 
+I built tune because I wanted a CLI music client that fit my Linux desktop workflow without storing my Navidrome credentials in a plaintext configuration file. Rather than implementing audio playback, I chose to build around mpv, using a background daemon to maintain playback state and support integration with tools such as Waybar and external search interfaces.
+
 The client is designed around a simple workflow:
 
 ```console
